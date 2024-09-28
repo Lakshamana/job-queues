@@ -6,40 +6,23 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
-	"gorm.io/driver/postgres"
+	"github.com/Lakshamana/job-queues/config"
+	"github.com/Lakshamana/job-queues/types"
+	"github.com/hibiken/asynq"
 	"gorm.io/gorm"
 )
 
-type JobStatus string
-
-const (
-	STARTED  JobStatus = "STARTED"
-	FINISHED JobStatus = "FINISHED"
-	FAILED   JobStatus = "FAILED"
+// a.k.a's
+type (
+	Job   types.Job
+	Error types.Error
 )
 
-// Defines Job model
-type Job struct {
-	Timestamp time.Time `json:"timestamp"`
-	gorm.Model
-	Status JobStatus `json:"status" gorm:"type:job_status;default:'STARTED'"`
-	Id     uuid.UUID `json:"id" gorm:"primary_key;type:uuid;default:gen_random_uuid()"`
-}
-
-// Cast error Message back to client
-type Error struct {
-	Message string `json:"message"`
-}
-
 var (
-	redisClient *redis.Client
+	queueClient *asynq.Client
 	db          *gorm.DB
-	keyID       = 1
 )
 
 var ctx = context.Background()
@@ -49,29 +32,23 @@ func init() {
 	log.SetOutput(os.Stdout)
 
 	var err error
-	db, err = gorm.Open(
-		postgres.Open("postgresql://root:password@localhost:5432/job-db"),
-		&gorm.Config{})
+	db, err = config.NewDBConnection(config.DB_CONN_STR)
 	if err != nil {
-		log.Printf(">> Error %v", err)
+		log.Panicf(">> Error %v", err)
 		panic(err)
 	}
 
 	db.AutoMigrate(&Job{})
 
 	// Setting up redis client
-	redisClient = redis.NewClient(&redis.Options{
-		Addr:     "127.0.0.1:6379",
-		Password: "",
-		DB:       0,
-	})
-
+	queueClient = config.NewQueueProducerConnection(config.REDIS_CONN_STR)
 	log.Println("Setting up redis client...")
 }
 
 func main() {
 	http.HandleFunc("POST /create-job", createJobHandler)
 	http.HandleFunc("GET /jobs/{id}", getJobHandler)
+	defer queueClient.Close()
 
 	log.Println("Listening at port 3000...")
 	http.ListenAndServe(":3000", nil)
@@ -87,29 +64,32 @@ func getJobHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func createJobHandler(w http.ResponseWriter, r *http.Request) {
-	job := createJob()
-
-	jobJson, err := json.Marshal(job)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(&Error{"cannot parse job"})
-
-		log.Printf(">> Error %v", err)
-		return
-	}
-
-	err = redisClient.Set(ctx, strconv.Itoa(keyID), string(jobJson), 0).Err()
+	job := Job{Timestamp: time.Now()}
+	task, err := NewJob(&job)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		log.Printf(">> Error %v", err)
-		json.NewEncoder(w).Encode(&Error{"cannot queue job"})
+		json.NewEncoder(w).Encode(&Error{Message: "cannot create job"})
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
-	json.NewEncoder(w).Encode(&job)
+	taskInfo, err := queueClient.Enqueue(task)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		log.Printf(">> Error %v", err)
+		json.NewEncoder(w).Encode(&Error{Message: "cannot queue job"})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(&Job{ID: taskInfo.ID})
 }
 
-func createJob() *Job {
-	return &Job{Timestamp: time.Now()}
+func NewJob(job *Job) (*asynq.Task, error) {
+	jobJson, err := json.Marshal(job)
+	if err != nil {
+		return nil, err
+	}
+
+	return asynq.NewTask(types.JOB_TYPENAME, jobJson), nil
 }
